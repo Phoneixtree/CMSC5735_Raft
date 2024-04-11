@@ -4,13 +4,15 @@ import (
 	"context"
 	"cuhk/asgn/raft"
 	"fmt"
-	"google.golang.org/grpc"
 	"log"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -44,9 +46,22 @@ func main() {
 }
 
 type raftNode struct {
-	log []*raft.LogEntry
-	// TODO: Implement this!
-
+	// TODO: Implement this! Done
+	log               []*raft.LogEntry
+	hashMap           map[string]int32
+	serverState       raft.Role
+	nodeId            int32
+	electionTimeout   int32
+	heartBeatInterval int32
+	currentTerm       int32
+	votedFor          int32
+	commitIndex       int32
+	nextIndex         map[int32]int32
+	matchIndex        map[int32]int32
+	commitChan        chan bool
+	resetChan         chan bool
+	mutex             sync.Mutex
+	majoritySize      int
 }
 
 // Desc:
@@ -72,7 +87,19 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 	hostConnectionMap := make(map[int32]raft.RaftNodeClient)
 
 	rn := raftNode{
-		log: nil,
+		log:               nil,
+		hashMap:           make(map[string]int32),
+		serverState:       raft.Role_Follower,
+		heartBeatInterval: int32(heartBeatInterval),
+		electionTimeout:   int32(electionTimeout),
+		currentTerm:       0,
+		votedFor:          -1,
+		nextIndex:         make(map[int32]int32),
+		matchIndex:        make(map[int32]int32),
+		resetChan:         make(chan bool, 1),
+		commitChan:        make(chan bool, 1),
+		majoritySize:      (len(nodeidPortMap)+1)/2 + 1,
+		commitIndex:       0,
 	}
 
 	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", myport))
@@ -109,7 +136,129 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 	}
 	log.Printf("Successfully connect all nodes")
 
-	//TODO: kick off leader election here !
+	//TODO: kick off leader election here ! Done 240408
+	ctx := context.Background()
+	go func() {
+		for {
+			switch rn.serverState {
+			case raft.Role_Leader:
+				for hostID, client := range hostConnectionMap {
+					go func(hostId int32, client raft.RaftNodeClient) {
+						rn.mutex.Lock()
+						var nextLogIndex = rn.nextIndex[hostId]
+						var prevLogIndex = 0
+						if nextLogIndex > 1 {
+							prevLogIndex = int(nextLogIndex - 1)
+						}
+						var prevLogTerm = 0
+						if prevLogIndex > 0 {
+							prevLogTerm = int(rn.log[prevLogIndex-1].Term)
+						}
+
+						sendLog := make([]*raft.LogEntry, 0)
+						if nextLogIndex > 0 {
+							sendLog = append(sendLog, rn.log[nextLogIndex-1:]...)
+						}
+						rn.mutex.Unlock()
+						reply, err := client.AppendEntries(ctx, &raft.AppendEntriesArgs{
+							From:         int32(nodeId),
+							To:           hostId,
+							Term:         rn.currentTerm,
+							LeaderId:     int32(nodeId),
+							PrevLogIndex: int32(prevLogIndex),
+							PrevLogTerm:  int32(prevLogTerm),
+							Entries:      sendLog,
+							LeaderCommit: rn.commitIndex,
+						})
+
+						if err == nil {
+							rn.mutex.Lock()
+							if reply.Success {
+								rn.matchIndex[hostId] = reply.MatchIndex
+								rn.nextIndex[hostId] = reply.MatchIndex + 1
+								flag := true
+								for flag {
+									count := 1
+									for i := range rn.matchIndex {
+										if rn.matchIndex[i] >= rn.commitIndex+1 {
+											count++
+										}
+									}
+									if count >= rn.majoritySize {
+										rn.commitIndex = rn.commitIndex + 1
+										rn.commitChan <- true
+									} else if count < rn.majoritySize {
+										flag = false
+									}
+								}
+							} else {
+								rn.nextIndex[hostId]--
+							}
+							rn.mutex.Unlock()
+						}
+					}(hostID, client)
+				}
+				select {
+				case <-time.After(time.Duration(rn.heartBeatInterval) * time.Millisecond):
+				case <-rn.resetChan:
+				}
+
+			case raft.Role_Follower:
+				select {
+				case <-time.After(time.Duration(rn.electionTimeout) * time.Millisecond):
+					rn.serverState = raft.Role_Candidate
+				case <-rn.resetChan:
+				}
+
+			case raft.Role_Candidate:
+				rn.mutex.Lock()
+				rn.currentTerm++
+				rn.votedFor = int32(nodeId)
+				lastLogIndex := len(rn.log)
+				lastLogTerm := 0
+				if lastLogIndex > 0 {
+					lastLogTerm = int(rn.log[lastLogIndex-1].Term)
+				}
+				rn.mutex.Unlock()
+
+				voteNum := 1
+				for hostID, client := range hostConnectionMap {
+					go func(hostId int32, c raft.RaftNodeClient) {
+						reply, err := c.RequestVote(ctx, &raft.RequestVoteArgs{
+							From:         int32(nodeId),
+							To:           hostId,
+							Term:         rn.currentTerm,
+							LastLogIndex: int32(lastLogIndex),
+							LastLogTerm:  int32(lastLogTerm),
+						})
+						if err == nil {
+							if reply.VoteGranted && reply.Term == rn.currentTerm {
+								rn.mutex.Lock()
+								voteNum++
+								rn.mutex.Unlock()
+								if voteNum >= rn.majoritySize && rn.serverState == raft.Role_Candidate {
+									rn.serverState = raft.Role_Leader
+									for i := range rn.nextIndex {
+										rn.nextIndex[i] = int32(len(rn.log))
+									}
+									for i := range rn.matchIndex {
+										rn.matchIndex[i] = 0
+									}
+									rn.resetChan <- true
+								}
+							} else if reply.Term > rn.currentTerm {
+								rn.serverState = raft.Role_Follower
+							}
+						}
+					}(hostID, client)
+				}
+				select {
+				case <-time.After(time.Duration(rn.electionTimeout) * time.Millisecond):
+				case <-rn.resetChan:
+				}
+			}
+		}
+	}()
 
 	return &rn, nil
 }
@@ -128,9 +277,41 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 // args: the operation to propose
 // reply: as specified in Desc
 func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.ProposeReply, error) {
-	// TODO: Implement this!
+	// TODO: Implement this! Done 240403
 	log.Printf("Receive propose from client")
 	var ret raft.ProposeReply
+
+	switch rn.serverState {
+	case raft.Role_Leader:
+		rn.log = append(rn.log, &raft.LogEntry{
+			Term:  rn.currentTerm,
+			Op:    args.GetOp(),
+			Key:   args.GetKey(),
+			Value: args.GetV(),
+		})
+		<-rn.commitChan
+
+		ret.CurrentLeader = rn.nodeId
+		switch args.GetOp() {
+		case raft.Operation_Put:
+			ret.Status = raft.Status_OK
+			rn.hashMap[args.Key] = args.GetV()
+		case raft.Operation_Delete:
+			_, ok := rn.hashMap[args.GetKey()]
+			if ok {
+				ret.Status = raft.Status_OK
+				delete(rn.hashMap, args.GetKey())
+			} else {
+				ret.Status = raft.Status_KeyNotFound
+			}
+		}
+	case raft.Role_Follower:
+		ret.Status = raft.Status_WrongNode
+		ret.CurrentLeader = rn.votedFor
+	case raft.Role_Candidate:
+		ret.Status = raft.Status_WrongNode
+		ret.CurrentLeader = rn.votedFor
+	}
 
 	return &ret, nil
 }
@@ -143,8 +324,15 @@ func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.
 // args: the key to check
 // reply: the value and status for this lookup of the given key
 func (rn *raftNode) GetValue(ctx context.Context, args *raft.GetValueArgs) (*raft.GetValueReply, error) {
-	// TODO: Implement this!
+	// TODO: Implement this! Done 240320
 	var ret raft.GetValueReply
+	tmpValue, ok := rn.hashMap[args.GetKey()]
+	if ok {
+		ret.Status = raft.Status_KeyFound
+		ret.V = tmpValue
+	} else {
+		ret.Status = raft.Status_KeyNotFound
+	}
 	return &ret, nil
 }
 
@@ -156,8 +344,35 @@ func (rn *raftNode) GetValue(ctx context.Context, args *raft.GetValueArgs) (*raf
 // you call this API
 // reply: the RequestVote Reply Message
 func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
-	// TODO: Implement this!
+	// TODO: Implement this! Done 240330
 	var reply raft.RequestVoteReply
+	reply.From = args.GetTo()
+	reply.To = args.GetFrom()
+
+	if args.GetTerm() < rn.currentTerm {
+		reply.VoteGranted = false
+	} else if args.GetTerm() == rn.currentTerm {
+		if rn.votedFor != -1 {
+			reply.VoteGranted = false
+		} else {
+			if rn.votedFor != args.GetCandidateId() {
+				reply.VoteGranted = false
+			} else {
+				reply.VoteGranted = true
+			}
+		}
+	} else {
+		reply.VoteGranted = true
+	}
+
+	if reply.VoteGranted {
+		rn.votedFor = args.GetFrom()
+		rn.currentTerm = args.GetTerm()
+		rn.serverState = raft.Role_Follower
+		rn.resetChan <- true
+	}
+
+	reply.Term = rn.currentTerm
 	return &reply, nil
 }
 
@@ -169,8 +384,59 @@ func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs)
 // you call this API
 // reply: the AppendEntries Reply Message
 func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
-	// TODO: Implement this
+	// TODO: Implement this! Done 240401
 	var reply raft.AppendEntriesReply
+
+	reply.From = args.GetTo()
+	reply.To = args.GetFrom()
+	reply.Success = true
+
+	if args.GetTerm() < rn.currentTerm {
+		reply.Success = false
+	} else {
+		if args.GetPrevLogIndex() > 0 {
+			if args.GetPrevLogIndex() > int32(len(rn.log)) {
+				reply.Success = false
+			}
+			if rn.log[args.GetPrevLogIndex()-1].Term != args.GetPrevLogTerm() {
+				reply.Success = false
+				rn.log = rn.log[:args.GetPrevLogIndex()]
+			}
+		}
+	}
+
+	if reply.Success {
+		rn.currentTerm = args.GetTerm()
+		rn.votedFor = args.GetFrom()
+		rn.log = append(rn.log, args.GetEntries()...)
+		reply.MatchIndex = int32(int(args.GetPrevLogIndex()) + len(args.GetEntries()))
+
+		if args.GetLeaderCommit() > rn.commitIndex {
+			var start int32
+			if rn.commitIndex > 0 {
+				start = rn.commitIndex - 1
+			} else {
+				start = 0
+			}
+			for _, entry := range rn.log[start:args.GetLeaderCommit()] {
+				if entry.Op == raft.Operation_Put {
+					rn.hashMap[entry.Key] = entry.Value
+				}
+				if entry.Op == raft.Operation_Delete {
+					_, ok := rn.hashMap[entry.Key]
+					if ok {
+						delete(rn.hashMap, entry.Key)
+					}
+				}
+			}
+			rn.commitIndex = args.GetLeaderCommit()
+		}
+		rn.serverState = raft.Role_Follower
+		rn.resetChan <- true
+	}
+
+	reply.Term = rn.currentTerm
+
 	return &reply, nil
 }
 
@@ -182,8 +448,10 @@ func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesA
 // args: the heartbeat duration
 // reply: no use
 func (rn *raftNode) SetElectionTimeout(ctx context.Context, args *raft.SetElectionTimeoutArgs) (*raft.SetElectionTimeoutReply, error) {
-	// TODO: Implement this!
+	// TODO: Implement this! Done 240320
 	var reply raft.SetElectionTimeoutReply
+	rn.electionTimeout = args.GetTimeout()
+	rn.resetChan <- true
 	return &reply, nil
 }
 
@@ -195,8 +463,10 @@ func (rn *raftNode) SetElectionTimeout(ctx context.Context, args *raft.SetElecti
 // args: the heartbeat duration
 // reply: no use
 func (rn *raftNode) SetHeartBeatInterval(ctx context.Context, args *raft.SetHeartBeatIntervalArgs) (*raft.SetHeartBeatIntervalReply, error) {
-	// TODO: Implement this!
+	// TODO: Implement this! Done 240320
 	var reply raft.SetHeartBeatIntervalReply
+	rn.heartBeatInterval = args.GetInterval()
+	rn.resetChan <- true
 	return &reply, nil
 }
 
